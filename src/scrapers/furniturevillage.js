@@ -7,32 +7,24 @@ export async function scrapeFurnitureVillage(url, size) {
   const html = await fetchHtml(url);
   const $ = cheerio.load(html);
 
-  // 1) JSON-LD first (handles Offer/AggregateOffer/lowPrice)
+  // 1) JSON-LD first (Offer/AggregateOffer)
   let price = jsonLdPrice(html);
 
-  // 2) Search embedded scripts for price-like fields
+  // 2) Try obvious PDP price containers (after JS render)
   if (!price) {
-    const scripts = $('script').toArray().map(s => $(s).contents().text());
-    const fields = [
-      /"salePrice"\s*:\s*([0-9]{3,5}(?:\.[0-9]{2})?)/i,
-      /"price"\s*:\s*([0-9]{3,5}(?:\.[0-9]{2})?)/i,
-      /"lowPrice"\s*:\s*([0-9]{3,5}(?:\.[0-9]{2})?)/i
+    const sels = [
+      '.price', '.now-price', '.product-price', '.amount',
+      '[itemprop="price"]', '#ourPrice', '.pdpPricing', '.pdp-price', '.sales'
     ];
-    for (const txt of scripts) {
-      for (const re of fields) {
-        const m = txt.match(re);
-        if (m) {
-          const n = Number(m[1]);
-          if (isValid(n)) { price = n; break; }
-        }
-      }
-      if (price) break;
+    for (const sel of sels) {
+      const p = extractPriceFromText($(sel).first().text());
+      if (p && isValid(p)) { price = p; break; }
     }
   }
 
-  // 3) Size-scoped DOM fallback: find nodes mentioning size; read nearby price
+  // 3) Size-scoped fallback: find text mentioning king/150x200 and read nearby price
   if (!price) {
-    const sels = ['.price', '.amount', '.product-price', '.now-price', '[itemprop="price"]'];
+    const sels = ['.price', '.now-price', '.product-price', '.amount', '[itemprop="price"]'];
     $('*').each((_, el) => {
       const t = $(el).text().trim();
       if (!t || !textMatchesSize(t, size)) return;
@@ -46,5 +38,5 @@ export async function scrapeFurnitureVillage(url, size) {
     });
   }
 
-  return { price: price ?? null, notes: price ? 'script/JSON or size-scoped' : 'no size price found' };
+  return { price: price ?? null, notes: price ? 'pdp/validated' : 'no size price found' };
 }

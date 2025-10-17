@@ -6,12 +6,16 @@ export async function scrapeLandOfBeds(url) {
   const html = await fetchHtml(url);
   const $ = cheerio.load(html);
 
-  // 1) JSON-LD (Offer / AggregateOffer) is most reliable
+  // 1) JSON-LD Offer/AggregateOffer
   let price = jsonLdPrice(html);
 
-  // 2) Fallback: obvious price blocks on PDP
+  // 2) Common PDP price selectors (after JS):
   if (!price) {
-    for (const sel of ['.price','.product-price','.amount','.woocommerce-Price-amount','[itemprop="price"]','#ourPrice','.now-price']) {
+    const sels = [
+      '.price', '.product-price', '#ourPrice', '.now-price',
+      '.amount', '.woocommerce-Price-amount', '[itemprop="price"]'
+    ];
+    for (const sel of sels) {
       const p = extractPriceFromText($(sel).first().text());
       if (p && isValid(p)) { price = p; break; }
     }
