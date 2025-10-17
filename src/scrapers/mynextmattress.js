@@ -1,45 +1,51 @@
 import * as cheerio from 'cheerio';
 import { fetchHtml } from '../utils/fetch.js';
 import { textMatchesSize } from '../utils/size.js';
-
-function parsePrice(txt) {
-  if (!txt) return null;
-  if (/per\s*month|finance|apr/i.test(txt)) return null;
-  if (/\bfrom\b/i.test(txt)) return null;
-  const m = txt.replace(/\u00A0/g,' ').match(/£\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{2})?)/);
-  if (!m) return null;
-  const n = Number(m[1].replace(/,/g,''));
-  return Number.isFinite(n) ? n : null;
-}
+import { jsonLdPrice, extractPriceFromText, isValid } from '../utils/price.js';
 
 export async function scrapeMyNextMattress(url, size) {
   const html = await fetchHtml(url);
   const $ = cheerio.load(html);
 
-  const priceSelectors = ['.price', '.product-price', '.woocommerce-Price-amount', '.amount', '[itemprop="price"]'];
+  // 1) JSON-LD often has the cash price
+  let price = jsonLdPrice(html);
 
-  let price = null;
-  $('*').each((_, el) => {
-    const txt = $(el).text().trim();
-    if (!txt || !textMatchesSize(txt, size)) return;
-
-    for (const sel of priceSelectors) {
-      const n = parsePrice($(el).closest('[class]').find(sel).first().text());
-      if (n) { price = n; return false; }
-    }
-    const n = parsePrice($(el).closest('[class]').text());
-    if (n) { price = n; return false; }
-  });
-
-  // MNM occasionally shows low “from” prices for smaller sizes — reject < £4,500
-  if (price && price < 4500) price = null;
-
+  // 2) WooCommerce: variations JSON on the form
   if (!price) {
-    for (const sel of priceSelectors) {
-      const n = parsePrice($(sel).first().text());
-      if (n && n >= 4500) { price = n; break; }
+    const form = $('form.variations_form[data-product_variations]').first();
+    const raw = form.attr('data-product_variations');
+    if (raw) {
+      try {
+        const variations = JSON.parse(raw);
+        for (const v of variations) {
+          // combine attributes + text blobs to check size match
+          const blob = [
+            v?.attributes ? Object.values(v.attributes).join(' ') : '',
+            v?.variation_description || '',
+            v?.sku || '',
+            v?.price_html || ''
+          ].join(' ').toLowerCase();
+          if (!textMatchesSize(blob, size)) continue;
+
+          // numeric price first
+          const numeric = Number(v.display_price ?? v.display_regular_price);
+          if (isValid(numeric)) { price = numeric; break; }
+
+          // price HTML fallback
+          const htmlPrice = extractPriceFromText(v.price_html);
+          if (htmlPrice && isValid(htmlPrice)) { price = htmlPrice; break; }
+        }
+      } catch {/* ignore */}
     }
   }
 
-  return { price: price ?? null, notes: price ? 'size-scoped price' : 'no size price found' };
+  // 3) Fallback to visible price blocks (still validated and > MIN)
+  if (!price) {
+    for (const sel of ['.price','.product-price','.woocommerce-Price-amount','.amount','[itemprop="price"]']) {
+      const p = extractPriceFromText($(sel).first().text());
+      if (p && isValid(p)) { price = p; break; }
+    }
+  }
+
+  return { price: price ?? null, notes: price ? 'variation JSON/validated' : 'no size price found' };
 }

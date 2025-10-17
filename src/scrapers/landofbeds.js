@@ -1,44 +1,21 @@
 import * as cheerio from 'cheerio';
 import { fetchHtml } from '../utils/fetch.js';
-import { textMatchesSize } from '../utils/size.js';
+import { jsonLdPrice, extractPriceFromText, isValid } from '../utils/price.js';
 
-function getPrice(txt) {
-  if (!txt) return null;
-  if (/per\s*month|finance|apr/i.test(txt)) return null;
-  if (/\bfrom\b/i.test(txt)) return null;
-  const m = txt.replace(/\u00A0/g,' ').match(/£\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{2})?)/);
-  if (!m) return null;
-  const n = Number(m[1].replace(/,/g,''));
-  return Number.isFinite(n) ? n : null;
-}
-
-export async function scrapeLandOfBeds(url, size) {
+export async function scrapeLandOfBeds(url) {
   const html = await fetchHtml(url);
   const $ = cheerio.load(html);
 
-  const priceSel = ['.price', '.amount', '.woocommerce-Price-amount', '.product-price', '[itemprop="price"]'];
-  let price = null;
+  // 1) JSON-LD (Offer / AggregateOffer) is most reliable
+  let price = jsonLdPrice(html);
 
-  $('*').each((_, el) => {
-    const t = $(el).text().trim();
-    if (!t || !textMatchesSize(t, size)) return;
-
-    for (const sel of priceSel) {
-      const n = getPrice($(el).closest('[class]').find(sel).first().text());
-      if (n) { price = n; return false; }
-    }
-    const n = getPrice($(el).closest('[class]').text());
-    if (n) { price = n; return false; }
-  });
-
-  if (price && price < 4500) price = null;
-
+  // 2) Fallback: obvious price blocks on PDP
   if (!price) {
-    for (const sel of priceSel) {
-      const n = getPrice($(sel).first().text());
-      if (n && n >= 4500) { price = n; break; }
+    for (const sel of ['.price','.product-price','.amount','.woocommerce-Price-amount','[itemprop="price"]','#ourPrice','.now-price']) {
+      const p = extractPriceFromText($(sel).first().text());
+      if (p && isValid(p)) { price = p; break; }
     }
   }
 
-  return { price: price ?? null, notes: price ? 'size-scoped price' : 'no size price found' };
+  return { price: price ?? null, notes: price ? 'pdp/validated' : 'no price found' };
 }
