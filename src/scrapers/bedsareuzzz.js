@@ -1,35 +1,69 @@
 import * as cheerio from 'cheerio';
 import { fetchHtml } from '../utils/fetch.js';
-import { jsonLdPrice, extractPriceFromText, firstValidPriceBySelectors } from '../utils/price.js';
-import { textMatchesSize } from '../utils/size.js';
+import { jsonLdPrice, extractPriceFromText } from '../utils/price.js';
 
-const PRICE_SELS = ['.price','.product-price','.amount','.woocommerce-Price-amount','[itemprop="price"]'];
+// BAU: main cash price is in .sale-price (when on offer). Fall back to other PDP price blocks.
+// Ignore service/add-on widgets (disposal, delivery, finance, etc.)
 
-export async function scrapeBedsAreUzzz(url, size) {
+const SERVICE_NEGATIVE = [
+  'disposal','recycle','removal','collection',
+  'assembly','install','set up',
+  'delivery','shipping',
+  'protector','topper','pillow','duvet',
+  'base','divan','frame','headboard',
+  'per month','finance','apr'
+];
+
+function isServicey(txt='') {
+  const s = String(txt).toLowerCase();
+  return SERVICE_NEGATIVE.some(k => s.includes(k));
+}
+
+export async function scrapeBedsAreUzzz(url /*, size */) {
   const html = await fetchHtml(url);
   const $ = cheerio.load(html);
 
-  // 1) JSON-LD
+  // 0) Try JSON-LD (sometimes already correct)
   let price = jsonLdPrice(html);
 
-  // 2) Look for explicit 150x200/king mentions, then take nearest price
+  // 1) Hard target BAU sale price
   if (!price) {
-    $('*').each((_, el) => {
-      const t = $(el).text().trim();
-      if (!t || !textMatchesSize(t, size)) return;
-      const scope = $(el).closest('[class]').length ? $(el).closest('[class]') : $(el).parent();
-      price = firstValidPriceBySelectors($, scope, PRICE_SELS) || extractPriceFromText(scope.text());
-      if (price) return false;
-    });
+    const saleTxt = $('.sale-price').first().text();
+    const p = extractPriceFromText(saleTxt);
+    if (p) price = p;
   }
 
-  // 3) Fallback: first obvious price block
+  // 2) If no sale-price, try regular PDP price containers
   if (!price) {
-    for (const sel of PRICE_SELS) {
-      const p = extractPriceFromText($(sel).first().text());
+    const sels = [
+      '.summary .price',
+      '.entry-summary .price',
+      '.product .price',
+      '.product-price',
+      '.woocommerce-Price-amount',
+      '.amount',
+      '[itemprop="price"]'
+    ];
+    for (const sel of sels) {
+      const txt = $(sel).first().text();
+      if (isServicey($(sel).first().closest('*').text())) continue; // skip service blocks
+      const p = extractPriceFromText(txt);
       if (p) { price = p; break; }
     }
   }
 
-  return { price: price ?? null, notes: price ? 'size-scoped/validated' : 'no price found' };
+  // 3) Last resort: scan big sections, skip anything that looks like a service widget
+  if (!price) {
+    let best = null;
+    $('.product, .summary, .entry-summary, main, .site-content, body').each((_, el) => {
+      const scope = $(el);
+      const text = scope.text();
+      if (isServicey(text)) return;
+      const p = extractPriceFromText(text);
+      if (p && (!best || p > best)) best = p;
+    });
+    price = best;
+  }
+
+  return { price: price ?? null, notes: price ? 'BAU .sale-price/PDP price' : 'no price found' };
 }
