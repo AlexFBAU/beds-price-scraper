@@ -1,46 +1,151 @@
-import * as cheerio from 'cheerio';
-import { fetchHtml } from '../utils/fetch.js';
-import { jsonLdPrice, extractPriceFromText, firstValidPriceBySelectors } from '../utils/price.js';
+// src/scrapers/bensons.js
+// Bensons for Beds — variant-aware scraper
+// Anchors on [data-variant-id] (and size text) so we don't grab the global Double price.
 
-const PRICE_SELS = [
-  '.now-price', '.sales', '.sale-price',
-  '#ourPrice', '.product-price', '.price',
-  '.amount', '[itemprop="price"]'
-];
+export async function scrapeBensons(page, { sizeCm }) {
+  // Give the page a moment to hydrate (guarded for Puppeteer versions without this API)
+  try { if (page.waitForNetworkIdle) await page.waitForNetworkIdle({ timeout: 2000 }); } catch {}
 
-const isKing = (s='') => /\bking\b|150\s*[x×]\s*200/i.test(s);
+  const normal = (s='') => s.toLowerCase().replace(/\s+/g,' ').trim();
+  const cm = normal(sizeCm || '');
+  const cmSpaced = normal((sizeCm || '').replace('x', ' x '));
 
-export async function scrapeBensons(url, size) {
-  const html = await fetchHtml(url);
-  const $ = cheerio.load(html);
+  const sizeAliases = (() => {
+    const map = {
+      '150x200': ['king','kingsize','king size','150x200','150 x 200'],
+      '135x190': ['double','135x190','135 x 190'],
+      '90x190' : ['single','90x190','90 x 190'],
+      '180x200': ['super king','superking','super kingsize','180x200','180 x 200'],
+      '120x190': ['small double','4ft','120x190','120 x 190'],
+      '75x190' : ['small single','75x190','75 x 190'],
+    };
+    const base = map[cm] || [cm, cmSpaced];
+    return Array.from(new Set(base.map(normal)));
+  })();
 
-  // 1) JSON-LD first (often already discounted on PDP)
-  let price = jsonLdPrice(html);
+  // Wait until variant blocks exist
+  await page.waitForSelector('[data-variant-id]', { timeout: 15000 }).catch(() => {});
 
-  // 2) Prefer "now/sale" price containers
-  if (!price) {
-    for (const sel of PRICE_SELS) {
-      const p = extractPriceFromText($(sel).first().text());
-      if (p) { price = p; break; }
-    }
-  }
+  const result = await page.evaluate((sizeAliases) => {
+    const norm = (s='') => s.toLowerCase().replace(/\s+/g,' ').trim();
+    const nums = (s='') => s.replace(/[^\d.]/g,'');
+    const $all = (sel, root=document) => Array.from(root.querySelectorAll(sel));
 
-  // 3) Size check: if the page shows size chips, make sure King/150x200 is selected
-  // (common patterns: chips with aria-selected="true" or .active)
-  const selectedChip = $('[aria-selected="true"], .is-selected, .active, .selected').first();
-  if (selectedChip.length) {
-    const chipText = selectedChip.text();
-    if (!isKing(chipText)) {
-      // If selected isn’t King, try to scope to a nearby container that mentions King
-      $('*').each((_, el) => {
-        const t = $(el).text().trim();
-        if (!t || !isKing(t)) return;
-        const scope = $(el).closest('[class]').length ? $(el).closest('[class]') : $(el).parent();
-        const scoped = firstValidPriceBySelectors($, scope, PRICE_SELS) || extractPriceFromText(scope.text());
-        if (scoped) { price = scoped; return false; }
+    // Try to resolve selected variant id from DOM/JSON/URL
+    const trySelectedVariantId = () => {
+      const chosen = document.querySelector('[aria-pressed="true"][data-variant-id], .is-selected[data-variant-id], .selected[data-variant-id], [data-variant-id].active, input[type="radio"][data-variant-id]:checked, option[data-variant-id][selected]');
+      if (chosen?.getAttribute) {
+        const vid = chosen.getAttribute('data-variant-id');
+        if (vid) return vid;
+      }
+      const tagged = $all('[data-variant-id]').find(el => {
+        const txt = norm(el.textContent||'');
+        const sel = el.matches('.is-selected, .selected, .active, [aria-current="true"]');
+        const mentionsSize = sizeAliases.some(a => txt.includes(norm(a)));
+        return sel || mentionsSize;
       });
+      if (tagged) return tagged.getAttribute('data-variant-id');
+
+      // Parse JSON state blobs for selectedVariantId
+      const scripts = $all('script');
+      for (const s of scripts) {
+        const t = (s.getAttribute('type')||'').toLowerCase();
+        const raw = s.textContent||'';
+        if (!raw) continue;
+        if (t.includes('json') || raw.trim().startsWith('{') || raw.trim().startsWith('[')) {
+          try {
+            const data = JSON.parse(raw);
+            const found = [];
+            const walk = (n) => {
+              if (!n || typeof n!=='object') return;
+              if (Array.isArray(n)) { n.forEach(walk); return; }
+              if ('selectedVariantId' in n && n.selectedVariantId) found.push(String(n.selectedVariantId));
+              Object.values(n).forEach(walk);
+            };
+            walk(data);
+            if (found.length) return found[0];
+          } catch {}
+        }
+      }
+
+      // URL patterns (?variant= or /variant/VID)
+      try {
+        const url = new URL(location.href);
+        if (url.searchParams.has('variant')) return url.searchParams.get('variant');
+        const m = url.pathname.match(/(?:variant|v|vid)[-/](\d{4,})/i);
+        if (m) return m[1];
+      } catch {}
+      return null;
+    };
+
+    const selectedVariantId = trySelectedVariantId();
+
+    // Candidate variant elements
+    const variantEls = $all('[data-variant-id]');
+    if (!variantEls.length) return { error: 'No variant elements found' };
+
+    const pickVariantEl = () => {
+      if (selectedVariantId) {
+        const exact = variantEls.find(el => el.getAttribute('data-variant-id') === String(selectedVariantId));
+        if (exact) return exact;
+      }
+      const bySize = variantEls.find(el => {
+        const txt = norm(el.textContent||'');
+        return sizeAliases.some(a => txt.includes(norm(a)));
+      });
+      if (bySize) return bySize;
+
+      const byState = variantEls.find(el => el.matches('.is-selected, .selected, .active, [aria-current="true"]'));
+      if (byState) return byState;
+
+      return variantEls[0];
+    };
+
+    const target = pickVariantEl();
+    if (!target) return { error: 'No target variant block' };
+
+    // Price resolution within/near the chosen variant
+    const priceSelectors = [
+      '[data-test*="price"]',
+      '[data-qa*="price"]',
+      '[class*="price"] [class*="value"]',
+      '[itemprop="price"]',
+      '.price__value', '.price--current', '.current-price', '.sales', '.price'
+    ].join(',');
+
+    let scope = target;
+    const container = target.closest('.product, .pdp, .product-detail, form, .buybox, .price-block, section, .panel');
+    if (!scope && container) scope = container;
+
+    let priceEl = scope.querySelector(priceSelectors);
+    if (!priceEl && container) priceEl = container.querySelector(priceSelectors);
+    if (!priceEl) {
+      let up = target.parentElement;
+      for (let i=0; i<2 && up && !priceEl; i++, up = up.parentElement) {
+        priceEl = up.querySelector(priceSelectors);
+      }
     }
+    if (!priceEl) return { error: 'No price element near target variant' };
+
+    const raw = priceEl.getAttribute('content') || priceEl.textContent || '';
+    const price = Number(nums(raw));
+    if (!isFinite(price) || price <= 0) return { error: 'Price not parseable' };
+
+    const currency =
+      priceEl.getAttribute('data-currency') ||
+      (document.querySelector('meta[itemprop="priceCurrency"], [itemprop="priceCurrency"]')?.getAttribute('content')) ||
+      (/\bgbp\b/i.test(raw) ? 'GBP' : 'GBP');
+
+    const nearTxt = norm((container || target).textContent || '');
+    const mentionsTargetSize = sizeAliases.some(a => nearTxt.includes(norm(a)));
+
+    return { price, currency, ok: true, mentionsTargetSize, selectedVariantId: selectedVariantId || null };
+  }, sizeAliases);
+
+  if (result?.ok) {
+    try { console.log('[bensons] vid=%s price=%s %s', result.selectedVariantId, result.price, result.mentionsTargetSize ? '' : '(size not confirmed)'); } catch {}
+    return { price: result.price, currency: result.currency, promoText: null };
   }
 
-  return { price: price ?? null, notes: price ? 'pdp/now-price scoped' : 'no price found' };
+  throw new Error('Bensons: variant-specific price not found — ' + (result?.error || 'unknown error'));
 }
