@@ -1,3 +1,4 @@
+// src/utils/price.js
 import * as cheerio from 'cheerio';
 
 const MIN = Number(process.env.MIN_PRICE_KING || 3000);
@@ -34,19 +35,42 @@ export function jsonLdPrice(html) {
             const p = Number(o?.price || o?.priceSpecification?.price || o?.lowPrice);
             if (isValid(p)) return p;
           }
-          if (isValid(Number(obj.price))) return Number(obj.price);
+          const p2 = Number(obj.price);
+          if (isValid(p2)) return p2;
         }
-      } catch {}
+      } catch {/* ignore bad JSON */}
     }
-  } catch {}
+  } catch {/* ignore */}
   return null;
 }
 
 export function firstValidPriceBySelectors($, scope, sels) {
   for (const sel of sels) {
-    const txt = scope.find(sel).first().text();
-    const p = extractPriceFromText(txt);
-    if (isValid(p)) return p;
+    const p = extractPriceFromText(scope.find(sel).first().text());
+    if (p) return p;
   }
   return null;
+}
+
+/* ===== Backwards compatibility (older scrapers call pickBestPrice) ===== */
+export function findMetaPrice(html) {
+  try {
+    const $ = cheerio.load(html);
+    const meta = $('[itemprop="price"], [property="product:price:amount"]');
+    for (const el of meta.toArray()) {
+      const content = $(el).attr('content') || $(el).attr('value') || $(el).text();
+      const p = extractPriceFromText(content);
+      if (p) return p;
+    }
+  } catch {}
+  return null;
+}
+
+export function findRegexPrice(html) {
+  return extractPriceFromText(html);
+}
+
+export function pickBestPrice(html) {
+  // old API used by initial scrapers
+  return jsonLdPrice(html) ?? findMetaPrice(html) ?? findRegexPrice(html);
 }
